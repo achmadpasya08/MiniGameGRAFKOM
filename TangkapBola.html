@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tangkap Bola - Grafik Komputer</title>
+<style>
+:root{color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#12162b;color:#fff;font-family:"Segoe UI",system-ui,sans-serif}
+.app{display:flex;gap:16px;padding:16px;height:100%;max-width:1500px;margin:auto}
+.stage{flex:1;min-width:0;display:flex;align-items:center;justify-content:center}
+canvas{width:100%;max-height:100%;aspect-ratio:3/2;border-radius:16px;background:#191e3a;box-shadow:0 10px 40px #0008;touch-action:none;display:block}
+aside{width:300px;background:#1c2142;border-radius:16px;padding:16px;overflow:auto}
+h2{margin:0 0 10px;font-size:16px;color:#ffd250}
+.hs{display:flex;justify-content:space-between;padding:8px 10px;border-radius:8px;background:#262c55;margin-bottom:6px;font-size:14px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+td,th{padding:5px 3px;text-align:left;border-bottom:1px solid #ffffff18}
+th{color:#97a0cc;font-weight:600}
+button{background:#3a4280;color:#fff;border:0;border-radius:8px;padding:8px 12px;cursor:pointer;margin-top:10px}
+button:hover{background:#4b55a8}
+.k{font-size:12px;color:#97a0cc;margin-top:12px;line-height:1.5}
+@media(max-width:820px){.app{flex-direction:column;height:auto}aside{width:100%}}
+</style></head><body>
+<div class="app">
+<div class="stage"><canvas id="c" width="900" height="600"></canvas></div>
+<aside>
+<h2>🏆 High Score</h2><div id="hs"></div>
+<h2 style="margin-top:16px">📜 Riwayat Permainan</h2><div id="hist"></div>
+<button id="clr">Hapus riwayat</button>
+<div class="k">Kontrol: ← → / A D atau gerakkan mouse/jari<br>H debug · R ulang · M menu · 1/2/3 pilih level<br>Algoritma: Collision Lingkaran vs AABB + translasi delta time</div>
+</aside></div>
+<script>
+const W=900,H=600,R=12,NYAWA=5;
+const LV={1:["BEGINNER",1.10,80,160,"#78ffa0","bola lambat, sedikit"],2:["MEDIUM",0.75,100,170,"#ffdc64","bola lambat, banyak"],3:["HARD",0.55,220,360,"#ff6e78","bola banyak, kencang"]};
+const cv=document.getElementById("c"),g=cv.getContext("2d");
+
+// ===== ALGORITMA UTAMA: COLLISION LINGKARAN vs AABB =====
+function circleAABB(cx,cy,r,b){
+  const nx=Math.max(b.minX,Math.min(cx,b.maxX));   // 1. CLAMP
+  const ny=Math.max(b.minY,Math.min(cy,b.maxY));
+  const dx=cx-nx,dy=cy-ny,d2=dx*dx+dy*dy;           // 2. JARAK^2
+  return {hit:d2<=r*r,near:[nx,ny],d2};             // 3. UJI d^2 <= r^2
+}
+
+// ===== Riwayat & high score (localStorage) =====
+let hist=[];
+try{hist=JSON.parse(localStorage.getItem("tb_hist")||"[]")}catch(e){}
+function save(){try{localStorage.setItem("tb_hist",JSON.stringify(hist))}catch(e){}}
+function best(l){return hist.filter(h=>h.l===l).reduce((m,h)=>Math.max(m,h.s),0)}
+function renderPanel(){
+  document.getElementById("hs").innerHTML=[1,2,3].map(k=>`<div class="hs"><span style="color:${LV[k][4]}">${LV[k][0]}</span><b>${best(LV[k][0])}</b></div>`).join("");
+  const rows=hist.slice(-10).reverse().map(h=>`<tr><td>${h.t}</td><td>${h.l}</td><td><b>${h.s}</b></td><td>${h.d}s</td></tr>`).join("");
+  document.getElementById("hist").innerHTML=rows?`<table><tr><th>Waktu</th><th>Level</th><th>Skor</th><th>Durasi</th></tr>${rows}</table>`:'<div class="k">Belum ada permainan.</div>';
+}
+document.getElementById("clr").onclick=()=>{hist=[];save();renderPanel()};
+
+// ===== State =====
+let level=null,debug=false,kr,bola,skor,nyawa,timer,durasi,log="-",newBest=false,over=false;
+const keys={};
+function reset(){kr={x:W/2-60,y:H-40,w:120,h:24};bola=[];skor=0;nyawa=NYAWA;timer=0;durasi=0;newBest=false;over=false}
+reset();
+function start(k){level=LV[k];reset()}
+function endGame(){
+  over=true;newBest=skor>best(level[0])&&skor>0;
+  const d=new Date(),p=n=>String(n).padStart(2,"0");
+  hist.push({t:`${p(d.getDate())}/${p(d.getMonth()+1)} ${p(d.getHours())}:${p(d.getMinutes())}`,l:level[0],s:skor,d:Math.round(durasi)});
+  if(hist.length>100)hist.shift();
+  save();renderPanel();
+}
+
+addEventListener("keydown",e=>{
+  keys[e.key.toLowerCase()]=true;
+  if(["arrowleft","arrowright"," "].includes(e.key.toLowerCase()))e.preventDefault();
+  if(level===null){if(LV[e.key])start(e.key)}
+  else{const k=e.key.toLowerCase();if(k==="h")debug=!debug;else if(k==="r")reset();else if(k==="m"){level=null;reset()}}
+});
+addEventListener("keyup",e=>keys[e.key.toLowerCase()]=false);
+
+function pos(e){const r=cv.getBoundingClientRect();return[(e.clientX-r.left)*W/r.width,(e.clientY-r.top)*H/r.height]}
+cv.addEventListener("pointermove",e=>{if(level&&!over){kr.x=Math.max(0,Math.min(W-kr.w,pos(e)[0]-kr.w/2))}});
+cv.addEventListener("pointerdown",e=>{
+  const[x,y]=pos(e);
+  if(level===null){for(let i=1;i<=3;i++){const t=230+(i-1)*95;if(x>250&&x<650&&y>t&&y<t+80)start(i)}}
+  else if(over)reset();
+  else kr.x=Math.max(0,Math.min(W-kr.w,x-kr.w/2));
+});
+
+// ===== Loop =====
+let last=performance.now();
+function frame(now){
+  const dt=Math.min((now-last)/1000,0.05);last=now;
+  // PROSES
+  if(level&&!over){
+    const arah=(keys.arrowright||keys.d?1:0)-(keys.arrowleft||keys.a?1:0);
+    kr.x+=arah*550*dt;                                  // TRANSLASI: x' = x + v*dt
+    kr.x=Math.max(0,Math.min(W-kr.w,kr.x));
+    durasi+=dt;timer+=dt;
+    const[,jeda,vmin,vmax]=level;
+    if(timer>jeda){bola.push({x:20+Math.random()*(W-40),y:0,v:vmin+Math.random()*(vmax-vmin)});timer=0}
+    const box={minX:kr.x,minY:kr.y,maxX:kr.x+kr.w,maxY:kr.y+kr.h};
+    for(let i=bola.length-1;i>=0;i--){
+      const b=bola[i];b.y+=b.v*dt;                      // TRANSLASI bola
+      const c=circleAABB(b.x,b.y,R,box);
+      if(debug&&b.y>H-140)log=`d²=${c.d2.toFixed(1)}  r²=${R*R}  -> ${c.hit?"KENA":"tidak"}`;
+      if(c.hit){bola.splice(i,1);skor++}
+      else if(b.y>H+R){bola.splice(i,1);nyawa--}
+    }
+    if(nyawa<=0)endGame();
+  }
+  // OUTPUT
+  g.clearRect(0,0,W,H);
+  const gr=g.createLinearGradient(0,0,0,H);gr.addColorStop(0,"#1d2350");gr.addColorStop(1,"#12162b");
+  g.fillStyle=gr;g.fillRect(0,0,W,H);
+  g.textAlign="center";
+  if(level===null){
+    g.fillStyle="#fff";g.font="bold 54px Segoe UI,sans-serif";g.fillText("TANGKAP BOLA",W/2,130);
+    g.font="18px Segoe UI,sans-serif";g.fillStyle="#97a0cc";g.fillText("Mini Game Grafik Komputer — Collision Detection Lingkaran vs AABB",W/2,170);
+    for(let i=1;i<=3;i++){
+      const t=230+(i-1)*95,L=LV[i];
+      g.fillStyle="#262c55";g.beginPath();g.roundRect(250,t,400,80,14);g.fill();
+      g.strokeStyle=L[4];g.lineWidth=2;g.stroke();
+      g.fillStyle=L[4];g.font="bold 24px Segoe UI,sans-serif";g.fillText(`[${i}] ${L[0]}`,W/2,t+34);
+      g.fillStyle="#97a0cc";g.font="16px Segoe UI,sans-serif";g.fillText(`${L[5]}  •  best ${best(L[0])}`,W/2,t+58);
+    }
+    g.fillStyle="#fff";g.font="16px Segoe UI,sans-serif";g.fillText("Klik level atau tekan 1 / 2 / 3",W/2,555);
+  }else{
+    g.fillStyle="#5ac8ff";g.beginPath();g.roundRect(kr.x,kr.y,kr.w,kr.h,6);g.fill();
+    for(const b of bola){
+      g.fillStyle="#ffd250";g.beginPath();g.arc(b.x,b.y,R,0,7);g.fill();
+      if(debug){g.strokeStyle="#50ff78";g.lineWidth=1;g.stroke()}
+    }
+    if(debug){
+      g.strokeStyle="#ff5050";g.lineWidth=1;g.strokeRect(kr.x,kr.y,kr.w,kr.h);
+      g.textAlign="left";g.fillStyle="#78ffa0";g.font="14px Consolas,monospace";
+      ["INPUT  : kiri/kanan / mouse","PROSES : x' = x + v*dt","         clamp -> d² -> d² <= r²","         "+log,"OUTPUT : gambar keranjang & bola"].forEach((t,i)=>g.fillText(t,16,64+i*20));
+    }
+    g.textAlign="left";g.fillStyle="#fff";g.font="bold 18px Segoe UI,sans-serif";
+    g.fillText(`${level[0]}   Skor: ${skor}   Nyawa: ${"❤".repeat(Math.max(nyawa,0))}   Best: ${Math.max(best(level[0]),skor)}`,16,30);
+    g.textAlign="right";g.fillStyle="#97a0cc";g.font="14px Segoe UI,sans-serif";g.fillText("[H] debug  [M] menu  [R] ulang",W-16,30);
+    if(over){
+      g.fillStyle="#000a";g.fillRect(0,0,W,H);g.textAlign="center";
+      g.fillStyle="#ff6e78";g.font="bold 48px Segoe UI,sans-serif";g.fillText("GAME OVER",W/2,H/2-30);
+      g.fillStyle="#fff";g.font="26px Segoe UI,sans-serif";g.fillText(`Skor ${skor}`,W/2,H/2+14);
+      if(newBest){g.fillStyle="#ffd250";g.fillText("🏆 HIGH SCORE BARU!",W/2,H/2+52)}
+      g.fillStyle="#97a0cc";g.font="16px Segoe UI,sans-serif";g.fillText("R / klik = ulang   M = menu",W/2,H/2+88);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+renderPanel();requestAnimationFrame(frame);
+</script></body></html>
