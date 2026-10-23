@@ -1,41 +1,39 @@
 """
-TANGKAP BOLA - Mini Game Grafik Komputer (logika di Python, tampilan di HTML)
+TANGKAP BOLA - Mini Game Grafik Komputer (pygame, dengan pilihan level + panel high score & riwayat)
 Algoritma utama : Collision Detection Lingkaran vs AABB (Axis-Aligned Bounding Box)
 Pendukung       : Translasi 2D (pergeseran posisi) berbasis delta time
 
-ARSITEKTUR
-  Python (file ini) : PROSES -> game loop 60 FPS, translasi, collision, skor, nyawa, level, riwayat
-  HTML              : INPUT & OUTPUT -> kirim tombol/mouse ke Python, gambar state dari Python
-
-Jalankan : python GK_MiniGame.py     (lalu buka http://localhost:8000)
-Butuh    : Python 3 saja (tanpa library tambahan). File TangkapBola.html harus satu folder.
+Kontrol (INTERAKSI PENGGUNA):
+  Menu      : tekan 1 / 2 / 3 atau klik kartu level
+  Main      : panah kiri/kanan atau A/D atau gerakkan mouse = geser keranjang (translasi)
+              H = mode debug    R = ulang level    M = kembali ke menu
+  Menu      : C = hapus riwayat
+  ESC       : keluar
 """
 import json
 import os
-import sys
-import threading
-import time
-import webbrowser
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
 import random
+import sys
+from datetime import datetime
 
-W, H = 900, 600
-R_BOLA = 12
+import pygame
+
+GW, H = 600, 500            # area game
+PW = 290                    # lebar panel kanan
+W = GW + PW                 # lebar jendela
+R_BOLA = 10
 NYAWA_AWAL = 5
-KECEPATAN_KERANJANG = 550          # px/detik
 
-# nama, jeda munculnya bola (detik), rentang kecepatan jatuh (px/detik), warna, keterangan
+# nama, jeda munculnya bola (detik), rentang kecepatan jatuh (px/detik)
 LEVELS = {
-    "1": ("CUNGPRET",    1.10, (80, 160),  "#78ffa0", "bola lambat, sedikit"),
-    "2": ("LUMAYAN LAH", 0.75, (100, 170), "#ffdc64", "bola lambat, banyak"),
-    "3": ("GOAT",        0.55, (220, 360), "#ff6e78", "bola banyak, kencang"),
+    pygame.K_1: ("CUNGPRET",    1.10, (80, 160)),
+    pygame.K_2: ("LUMAYAN LAH", 0.75, (100, 170)),
+    pygame.K_3: ("GOAT",        0.55, (220, 360)),
 }
-
-BASE = os.path.dirname(os.path.abspath(__file__))
-HTML_FILE = os.path.join(BASE, "TangkapBola.html")
-HIST_FILE = os.path.join(BASE, "riwayat.json")
+KET = {"CUNGPRET": "bola lambat, sedikit", "LUMAYAN LAH": "bola lambat, banyak", "GOAT": "bola banyak, kencang"}
+WARNA = {"CUNGPRET": (120, 255, 160), "LUMAYAN LAH": (255, 220, 100), "GOAT": (255, 110, 120)}
+TEKS, ABU, KUNING = (255, 255, 255), (151, 160, 204), (255, 210, 80)
+KARTU = [pygame.Rect(150, 195 + i * 92, 300, 78) for i in range(3)]       # kartu menu
 
 
 # ======================================================================
@@ -44,10 +42,13 @@ HIST_FILE = os.path.join(BASE, "riwayat.json")
 def circle_aabb(cx, cy, r, box):
     """Lingkaran (cx, cy, r) vs kotak box = (min_x, min_y, max_x, max_y).
 
-    1. CLAMP : titik pada kotak yang paling dekat dengan pusat lingkaran
-               nx = max(min_x, min(cx, max_x)) ; ny = max(min_y, min(cy, max_y))
-    2. JARAK : dx = cx - nx ; dy = cy - ny ; d^2 = dx^2 + dy^2
-    3. UJI   : tabrakan jika d^2 <= r^2   (tanpa akar kuadrat)
+    Langkah:
+      1. CLAMP : cari titik pada kotak yang paling dekat dengan pusat lingkaran
+                 nx = max(min_x, min(cx, max_x))
+                 ny = max(min_y, min(cy, max_y))
+      2. JARAK : dx = cx - nx ; dy = cy - ny ; d^2 = dx^2 + dy^2
+      3. UJI   : tabrakan jika d^2 <= r^2   (tanpa akar kuadrat)
+    Mengembalikan (tabrakan?, titik_terdekat, d2) supaya bisa ditampilkan.
     """
     min_x, min_y, max_x, max_y = box
     nx = max(min_x, min(cx, max_x))
@@ -57,240 +58,216 @@ def circle_aabb(cx, cy, r, box):
     return d2 <= r * r, (nx, ny), d2
 
 
-class Game:
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.keys = set()
-        self.level = None          # None = menu
-        self.debug = False
-        self.log = "-"
-        self.arah = 0
-        self.hist = self._load()
-        self.reset()
-
-    # ---------------- riwayat ----------------
-    def _load(self):
-        try:
-            with open(HIST_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-
-    def _save(self):
-        try:
-            with open(HIST_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.hist, f, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def best(self, nama):
-        return max([h["s"] for h in self.hist if h["l"] == nama], default=0)
-
-    # ---------------- state ----------------
-    def reset(self):
-        self.kr = [W / 2 - 60, H - 40, 120, 24]     # keranjang = [x, y, lebar, tinggi]
-        self.bola = []                              # tiap bola = [x, y, kecepatan]
-        self.skor = 0
-        self.nyawa = NYAWA_AWAL
-        self.timer = 0.0
-        self.durasi = 0.0
-        self.new_best = False
-        self.over = False
-
-    def end_game(self):
-        self.over = True
-        nama = self.level[0]
-        self.new_best = self.skor > self.best(nama) and self.skor > 0
-        self.hist.append({"t": datetime.now().strftime("%d/%m %H:%M"),
-                          "l": nama, "s": self.skor, "d": round(self.durasi)})
-        self.hist = self.hist[-100:]
-        self._save()
-
-    # ---------------- INPUT (dari HTML) ----------------
-    def handle(self, ev):
-        with self.lock:
-            t = ev.get("t")
-            if t == "key":
-                k = str(ev.get("key", "")).lower()
-                if ev.get("down"):
-                    self.keys.add(k)
-                    self._press(k)
-                else:
-                    self.keys.discard(k)
-            elif t == "move":
-                if self.level and not self.over:
-                    self._set_x(float(ev["x"]))
-            elif t == "click":
-                x, y = float(ev["x"]), float(ev["y"])
-                if self.level is None:
-                    for i in range(3):
-                        top = 230 + i * 95
-                        if 250 < x < 650 and top < y < top + 80:
-                            self._start(str(i + 1))
-                elif self.over:
-                    self.reset()
-                else:
-                    self._set_x(x)
-            elif t == "clear":
-                self.hist = []
-                self._save()
-
-    def _set_x(self, x):
-        self.kr[0] = max(0, min(W - self.kr[2], x - self.kr[2] / 2))
-
-    def _start(self, k):
-        self.level = LEVELS[k]
-        self.reset()
-
-    def _press(self, k):
-        if self.level is None:
-            if k in LEVELS:
-                self._start(k)
-        elif k == "h":
-            self.debug = not self.debug
-        elif k == "r":
-            self.reset()
-        elif k == "m":
-            self.level = None
-            self.reset()
-
-    # ---------------- PROSES ----------------
-    def update(self, dt):
-        with self.lock:
-            if self.level is None or self.over:
-                return
-            nama, jeda, (v_min, v_max), _, _ = self.level
-            kanan = "arrowright" in self.keys or "d" in self.keys
-            kiri = "arrowleft" in self.keys or "a" in self.keys
-            self.arah = int(kanan) - int(kiri)
-
-            self.kr[0] += self.arah * KECEPATAN_KERANJANG * dt     # TRANSLASI: x' = x + v*dt
-            self.kr[0] = max(0, min(W - self.kr[2], self.kr[0]))
-
-            self.durasi += dt
-            self.timer += dt
-            if self.timer > jeda:                                  # munculkan bola sesuai level
-                self.bola.append([random.randint(20, W - 20), 0.0, random.randint(v_min, v_max)])
-                self.timer = 0
-
-            kr = self.kr
-            box = (kr[0], kr[1], kr[0] + kr[2], kr[1] + kr[3])     # AABB keranjang
-            for b in self.bola[:]:
-                b[1] += b[2] * dt                                  # TRANSLASI bola: y' = y + v*dt
-                hit, near, d2 = circle_aabb(b[0], b[1], R_BOLA, box)   # COLLISION
-                if self.debug and b[1] > H - 140:
-                    self.log = f"d^2={d2:7.1f}  r^2={R_BOLA ** 2}  -> {'KENA' if hit else 'tidak'}"
-                if hit:
-                    self.bola.remove(b)
-                    self.skor += 1
-                elif b[1] > H + R_BOLA:
-                    self.bola.remove(b)
-                    self.nyawa -= 1
-            if self.nyawa <= 0:
-                self.end_game()
-
-    # ---------------- OUTPUT (dikirim ke HTML) ----------------
-    def snapshot(self):
-        with self.lock:
-            lv = self.level
-            return {
-                "W": W, "H": H, "r": R_BOLA,
-                "menu": [{"key": k, "nama": v[0], "warna": v[3], "ket": v[4], "best": self.best(v[0])}
-                         for k, v in LEVELS.items()],
-                "level": None if lv is None else {"nama": lv[0], "warna": lv[3]},
-                "kr": self.kr,
-                "bola": [[round(b[0], 1), round(b[1], 1)] for b in self.bola],
-                "skor": self.skor, "nyawa": self.nyawa,
-                "over": self.over, "new_best": self.new_best, "debug": self.debug,
-                "best": self.best(lv[0]) if lv else 0,
-                "debug_lines": [
-                    "INPUT  : kiri/kanan / mouse",
-                    f"PROSES : x' = x + v*dt ; arah={self.arah:+d}",
-                    "         clamp -> d^2 -> d^2 <= r^2",
-                    "         " + self.log,
-                    "OUTPUT : gambar keranjang & bola",
-                ],
-                "high": {v[0]: self.best(v[0]) for v in LEVELS.values()},
-                "warna": {v[0]: v[3] for v in LEVELS.values()},
-                "hist": self.hist[-10:][::-1],
-            }
+# ---------------- riwayat & high score (disimpan ke file) ----------------
+def load_hist():
+    try:
+        with open(HIST_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
-game = Game()
-
-
-def game_loop():
-    last = time.perf_counter()
-    while True:
-        now = time.perf_counter()
-        dt = min(now - last, 0.05)
-        last = now
-        game.update(dt)
-        time.sleep(1 / 60)
-
-
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *a):
+def save_hist(hist):
+    try:
+        with open(HIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(hist, f)
+    except Exception:
         pass
 
-    def do_GET(self):
-        if self.path == "/stream":                      # Server-Sent Events: state Python -> HTML
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            try:
-                while True:
-                    data = json.dumps(game.snapshot())
-                    self.wfile.write(f"data: {data}\n\n".encode())
-                    self.wfile.flush()
-                    time.sleep(1 / 60)
-            except OSError:
-                return
-        elif self.path in ("/", "/index.html"):
-            try:
-                with open(HTML_FILE, "rb") as f:
-                    body = f.read()
-            except OSError:
-                body = b"TangkapBola.html tidak ditemukan (harus satu folder dengan file ini)."
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+
+def best(hist, nama):
+    return max([h["s"] for h in hist if h["l"] == nama], default=0)
+
+
+# ---------------- helper tampilan ----------------
+def gradient(w, h, atas, bawah):
+    s = pygame.Surface((w, h))
+    for y in range(h):
+        t = y / (h - 1)
+        pygame.draw.line(s, tuple(int(atas[i] + (bawah[i] - atas[i]) * t) for i in range(3)), (0, y), (w, y))
+    return s
+
+
+def heart(surf, x, y, s, warna):
+    pygame.draw.circle(surf, warna, (int(x + s * 0.27), int(y + s * 0.3)), int(s * 0.27))
+    pygame.draw.circle(surf, warna, (int(x + s * 0.73), int(y + s * 0.3)), int(s * 0.27))
+    pygame.draw.polygon(surf, warna, [(x + 1, y + s * 0.42), (x + s - 1, y + s * 0.42), (x + s / 2, y + s * 0.95)])
+
+
+def tengah(surf, img, cx, cy):
+    surf.blit(img, img.get_rect(center=(cx, cy)))
+
+
+def main(frames=None, shot=None):
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Tangkap Bola - Grafik Komputer")
+    clock = pygame.time.Clock()
+    fam = "segoeui,helvetica,arial"
+    font = pygame.font.SysFont(fam, 20)
+    small = pygame.font.SysFont(fam, 16)
+    mono = pygame.font.SysFont("consolas,menlo,monospace", 14)
+    bold = pygame.font.SysFont(fam, 22, bold=True)
+    big = pygame.font.SysFont(fam, 52, bold=True)
+    judul_f = pygame.font.SysFont(fam, 40, bold=True)
+
+    latar = gradient(GW, H, (29, 35, 80), (18, 22, 43))
+    gelap = pygame.Surface((GW, H), pygame.SRCALPHA)
+    gelap.fill((0, 0, 0, 165))
+
+    hist = load_hist()
+
+    def reset():
+        return [GW / 2 - 60, H - 36, 120, 22], [], 0, NYAWA_AWAL, 0.0, 0.0   # keranjang, bola, skor, nyawa, timer, durasi
+
+    kr, bola, skor, nyawa, timer, durasi = reset()
+    level = None       # None = sedang di menu
+    debug = False
+    log = "-"
+    selesai = False    # supaya hasil game hanya dicatat sekali
+    new_best = False
+    n = 0
+
+    def mulai(key):
+        nonlocal level, kr, bola, skor, nyawa, timer, durasi, selesai, new_best
+        level = LEVELS[key]
+        kr, bola, skor, nyawa, timer, durasi = reset()
+        selesai = new_best = False
+
+    while True:
+        dt = min(clock.tick(60) / 1000, 0.05)
+        n += 1
+
+        # ---------------- INPUT ----------------
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                pygame.quit(); sys.exit()
+            if e.type == pygame.KEYDOWN:
+                if level is None:
+                    if e.key in LEVELS:                      # pilih level di menu
+                        mulai(e.key)
+                    elif e.key == pygame.K_c:
+                        hist = []; save_hist(hist)
+                else:
+                    if e.key == pygame.K_h:
+                        debug = not debug
+                    elif e.key == pygame.K_r:
+                        mulai(next(k for k, v in LEVELS.items() if v is level))
+                    elif e.key == pygame.K_m:
+                        level = None
+            elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+                if level is None:
+                    for i, k in enumerate(KARTU):
+                        if k.collidepoint(e.pos):
+                            mulai(list(LEVELS)[i])
+                elif nyawa <= 0:
+                    mulai(next(k for k, v in LEVELS.items() if v is level))
+            elif e.type == pygame.MOUSEMOTION and level is not None and nyawa > 0 and e.pos[0] < GW:
+                kr[0] = max(0, min(GW - kr[2], e.pos[0] - kr[2] / 2))    # keranjang ikut mouse
+        keys = pygame.key.get_pressed()
+        arah = (keys[pygame.K_RIGHT] or keys[pygame.K_d]) - (keys[pygame.K_LEFT] or keys[pygame.K_a])
+
+        # ---------------- PROSES ----------------
+        if level is not None and nyawa > 0:
+            nama, jeda, (v_min, v_max) = level
+
+            kr[0] += arah * 550 * dt                       # TRANSLASI: x' = x + v*dt
+            kr[0] = max(0, min(GW - kr[2], kr[0]))         # batas area game
+
+            durasi += dt
+            timer += dt
+            if timer > jeda:                               # munculkan bola sesuai level
+                bola.append([random.randint(20, GW - 20), 0.0, random.randint(v_min, v_max)])
+                timer = 0
+
+            box = (kr[0], kr[1], kr[0] + kr[2], kr[1] + kr[3])   # AABB keranjang
+            for b in bola[:]:
+                b[1] += b[2] * dt                          # TRANSLASI bola: y' = y + v*dt
+                hit, near, d2 = circle_aabb(b[0], b[1], R_BOLA, box)   # COLLISION
+                if debug and b[1] > H - 120:
+                    log = f"d^2={d2:6.1f} r^2={R_BOLA ** 2} -> {'KENA' if hit else 'tidak'}"
+                if hit:
+                    bola.remove(b); skor += 1
+                elif b[1] > H + R_BOLA:
+                    bola.remove(b); nyawa -= 1
+
+        if level is not None and nyawa <= 0 and not selesai:      # game over -> catat riwayat
+            selesai = True
+            new_best = skor > best(hist, level[0]) and skor > 0
+            hist.append({"t": datetime.now().strftime("%d/%m %H:%M"),
+                         "l": level[0], "s": skor, "d": round(durasi)})
+            hist = hist[-100:]
+            save_hist(hist)
+
+        # ---------------- OUTPUT (RENDER) ----------------
+        screen.blit(latar, (0, 0))
+        mx, my = pygame.mouse.get_pos()
+        if level is None:
+            tengah(screen, big.render("TANGKAP BOLA", True, TEKS), GW // 2, 75)
+            tengah(screen, small.render("Mini Game Grafik Komputer - Collision Lingkaran vs AABB", True, ABU), GW // 2, 125)
+            for i, (k, rect) in enumerate(zip(LEVELS, KARTU)):
+                nm = LEVELS[k][0]
+                hover = rect.collidepoint(mx, my)
+                pygame.draw.rect(screen, (50, 58, 108) if hover else (38, 44, 85), rect, border_radius=14)
+                pygame.draw.rect(screen, WARNA[nm], rect, 2, border_radius=14)
+                tengah(screen, bold.render(f"[{i + 1}] {nm}", True, WARNA[nm]), rect.centerx, rect.y + 26)
+                tengah(screen, small.render(f"{KET[nm]}  -  best {best(hist, nm)}", True, ABU), rect.centerx, rect.y + 54)
+            tengah(screen, small.render("Klik level atau tekan 1 / 2 / 3", True, TEKS), GW // 2, 478)
         else:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            # keranjang & bola
+            pygame.draw.rect(screen, (90, 200, 255), kr, border_radius=6)
+            pygame.draw.rect(screen, (170, 230, 255), (kr[0] + 4, kr[1] + 3, kr[2] - 8, 4), border_radius=2)
+            for b in bola:
+                pos = (int(b[0]), int(b[1]))
+                pygame.draw.circle(screen, (255, 210, 80), pos, R_BOLA)
+                pygame.draw.circle(screen, (255, 238, 170), (pos[0] - 3, pos[1] - 3), 3)
+                if debug:
+                    pygame.draw.circle(screen, (80, 255, 120), pos, R_BOLA, 1)
+            if debug:
+                pygame.draw.rect(screen, (255, 80, 80), kr, 1)       # AABB keranjang
+                baris = ["INPUT  : kiri/kanan / mouse",
+                         f"PROSES : x' = x + v*dt ; arah={arah:+d}",
+                         "         clamp -> d^2 -> d^2 <= r^2",
+                         "         " + log,
+                         "OUTPUT : gambar keranjang & bola"]
+                for i, t in enumerate(baris):
+                    screen.blit(mono.render(t, True, (120, 255, 160)), (14, 60 + i * 18))
+            # HUD
+            screen.blit(bold.render(level[0], True, WARNA[level[0]]), (14, 10))
+            screen.blit(small.render(f"Skor: {skor}   Best: {max(best(hist, level[0]), skor)}", True, TEKS), (14, 36))
+            for i in range(max(nyawa, 0)):
+                heart(screen, GW - 28 - i * 24, 12, 18, (255, 90, 110))
+            screen.blit(small.render("[H] debug  [R] ulang  [M] menu", True, ABU),
+                        (GW - 14 - small.size("[H] debug  [R] ulang  [M] menu")[0], 36))
+            if nyawa <= 0:
+                screen.blit(gelap, (0, 0))
+                tengah(screen, big.render("GAME OVER", True, (255, 110, 120)), GW // 2, H // 2 - 50)
+                tengah(screen, font.render(f"Skor {skor}", True, TEKS), GW // 2, H // 2 + 2)
+                if new_best:
+                    tengah(screen, bold.render("HIGH SCORE BARU!", True, KUNING), GW // 2, H // 2 + 36)
+                tengah(screen, small.render("R / klik = ulang    M = menu", True, ABU), GW // 2, H // 2 + 76)
 
-    def do_POST(self):                                  # input HTML -> Python
-        if self.path == "/input":
-            n = int(self.headers.get("Content-Length", 0))
-            try:
-                game.handle(json.loads(self.rfile.read(n) or b"{}"))
-            except Exception:
-                pass
-        self.send_response(204)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-
-def main(port=8000):
-    threading.Thread(target=game_loop, daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    server.daemon_threads = True
-    url = f"http://localhost:{port}"
-    print(f"Tangkap Bola jalan di {url}  (Ctrl+C untuk berhenti)")
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nBerhenti.")
-        sys.exit()
-
-
+        # ---------------- PANEL HIGH SCORE & RIWAYAT ----------------
+        pygame.draw.rect(screen, (28, 33, 66), (GW, 0, PW, H))
+        x0, lebar = GW + 12, PW - 24
+        screen.blit(bold.render("HIGH SCORE", True, KUNING), (x0 + 2, 12))
+        for i, nm in enumerate(["CUNGPRET", "LUMAYAN LAH", "GOAT"]):
+            r = pygame.Rect(x0, 46 + i * 34, lebar, 28)
+            pygame.draw.rect(screen, (38, 44, 85), r, border_radius=8)
+            screen.blit(small.render(nm, True, WARNA[nm]), (r.x + 10, r.y + 5))
+            v = small.render(str(best(hist, nm)), True, TEKS)
+            screen.blit(v, (r.right - 10 - v.get_width(), r.y + 5))
+        screen.blit(bold.render("RIWAYAT", True, KUNING), (x0 + 2, 160))
+        screen.blit(mono.render("Waktu       Level    Skor Durasi", True, ABU), (x0 + 6, 192))
+        if not hist:
+            screen.blit(small.render("Belum ada permainan.", True, ABU), (x0 + 6, 218))
+        for i, h in enumerate(hist[-11:][::-1]):
+            r = pygame.Rect(x0, 212 + i * 24, lebar, 22)
+            if i % 2 == 0:
+                pygame.draw.rect(screen, (34, 40, 78), r, border_radius=6)
+            baris = f"{h['t']} {h['l'].split()[0]:<8} {h['s']:>3} {h['d']:>4}s"
+            screen.blit(mono.render(baris, True, WARNA[h["l"]]), (r.x + 6, r.y + 3))
+        screen.blit(mono.render("[C] hapus riwayat (di menu)", True, (110, 120, 160)), (x0 + 6, H - 22))
+        pygame.display.flip()
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 8000)
+    main()
